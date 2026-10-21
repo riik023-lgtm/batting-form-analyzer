@@ -1,0 +1,8 @@
+streamlit
+mediapipe
+opencv-python-headless
+numpy
+pandas
+matplotlib
+imageio-ffmpeg
+reportlab
