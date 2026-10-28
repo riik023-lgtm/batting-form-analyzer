@@ -76,25 +76,27 @@ configure_output_directory()
 
 def setup_japanese_font():
     """
-    Windows内にある日本語フォントを探し、
-    Matplotlibのフォントとして設定する。
+    Windows / Linux(Streamlit Cloud) の両方で
+    日本語フォントを設定する。
     """
 
     candidate_paths = [
+        # Streamlit Cloud / Linux
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+
+        # Windows
         r"C:\Windows\Fonts\meiryo.ttc",
         r"C:\Windows\Fonts\meiryob.ttc",
         r"C:\Windows\Fonts\YuGothM.ttc",
         r"C:\Windows\Fonts\YuGothR.ttc",
-        r"C:\Windows\Fonts\msgothic.ttc"
+        r"C:\Windows\Fonts\msgothic.ttc",
     ]
 
     for font_path in candidate_paths:
-
         if os.path.exists(font_path):
 
-            font_manager.fontManager.addfont(
-                font_path
-            )
+            font_manager.fontManager.addfont(font_path)
 
             font_name = font_manager.FontProperties(
                 fname=font_path
@@ -103,11 +105,43 @@ def setup_japanese_font():
             plt.rcParams["font.family"] = font_name
             plt.rcParams["axes.unicode_minus"] = False
 
-            print()
             print("日本語フォントを設定しました:")
             print(font_name)
 
             return font_name
+
+    for font_path in font_manager.findSystemFonts():
+
+        lower_name = font_path.lower()
+
+        if (
+            "notosanscjk" in lower_name
+            or "noto" in lower_name
+            or "ipa" in lower_name
+        ):
+            try:
+                font_manager.fontManager.addfont(font_path)
+
+                font_name = font_manager.FontProperties(
+                    fname=font_path
+                ).get_name()
+
+                plt.rcParams["font.family"] = font_name
+                plt.rcParams["axes.unicode_minus"] = False
+
+                print("日本語フォントを設定しました:")
+                print(font_name)
+
+                return font_name
+
+            except Exception:
+                pass
+
+    plt.rcParams["axes.unicode_minus"] = False
+
+    print("日本語フォントが見つかりませんでした。")
+
+    return None
 
     plt.rcParams["axes.unicode_minus"] = False
 
