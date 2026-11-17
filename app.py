@@ -515,14 +515,56 @@ else:
             st.markdown("**最も違う動き**")
             st.subheader(result["lowest_item"])
 
+        def quality_display(analysis):
+            score = float(analysis.quality_score)
+            if score >= 80:
+                return "高", "この動画は安定して骨格解析できています。"
+            if score >= 60:
+                return "要確認", "一部のフレームで骨格検出が不安定です。結果は参考値として確認してください。"
+            return "低", "骨格検出が不安定です。撮影条件や解析範囲を見直してください。"
+
+        ref_quality_label, ref_quality_message = quality_display(ref)
+        tar_quality_label, tar_quality_message = quality_display(tar)
+
         q1, q2 = st.columns(2)
         with q1:
-            st.metric("解析信頼度: 比較選手", f"{ref.quality_score:.1f} / 100")
-            st.caption(f"骨格推定品質: {ref.quality_label}")
+            with st.container(border=True):
+                st.markdown(f"**骨格検出品質：{ref_quality_label}**")
+                st.caption(f"比較選手：{ref_quality_message}")
         with q2:
-            st.metric("解析信頼度: 自分", f"{tar.quality_score:.1f} / 100")
-            st.caption(f"骨格推定品質: {tar.quality_label}")
-        st.caption("解析信頼度だけは0〜100を使用します。これはフォーム評価ではなく、骨格推定をどの程度信用できるかの品質指標です。")
+            with st.container(border=True):
+                st.markdown(f"**骨格検出品質：{tar_quality_label}**")
+                st.caption(f"自分：{tar_quality_message}")
+
+        if min(float(ref.quality_score), float(tar.quality_score)) < 80:
+            st.warning(
+                "骨格検出品質が『要確認』の動画が含まれています。フォーム差だけでなく、"
+                "画質・遮蔽・撮影角度・解析範囲の影響を受けている可能性があります。"
+            )
+
+        with st.expander("解析品質の詳細を見る", expanded=False):
+            ref_q = ref.quality_details or {}
+            tar_q = tar.quality_details or {}
+            quality_detail = pd.DataFrame([
+                {
+                    "動画": "比較選手",
+                    "内部品質スコア": round(float(ref.quality_score), 1),
+                    "全体骨格検出率": f"{ref_q.get('overall_detection_rate', 0):.1%}",
+                    "インパクト周辺検出率": f"{ref_q.get('impact_window_detection_rate', 0):.1%}",
+                    "主要関節visibility": f"{ref_q.get('key_joint_visibility', 0):.2f}",
+                },
+                {
+                    "動画": "自分",
+                    "内部品質スコア": round(float(tar.quality_score), 1),
+                    "全体骨格検出率": f"{tar_q.get('overall_detection_rate', 0):.1%}",
+                    "インパクト周辺検出率": f"{tar_q.get('impact_window_detection_rate', 0):.1%}",
+                    "主要関節visibility": f"{tar_q.get('key_joint_visibility', 0):.2f}",
+                },
+            ])
+            st.dataframe(quality_detail, use_container_width=True, hide_index=True)
+            st.caption(
+                "内部品質スコアはフォームの良し悪しではありません。骨格推定がどの程度安定していたかを確認するための品質管理値です。"
+            )
 
         st.markdown("#### 5項目の比較")
         for _, row in result["score_dataframe"].iterrows():
