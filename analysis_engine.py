@@ -280,6 +280,32 @@ def _safe_nanmedian(values, default=np.nan):
     return float(np.median(finite)) if finite.size else float(default)
 
 
+def _safe_nanpercentile(values, q, default=np.nan):
+    """NaNを除いてパーセンタイルを返す。外れ値1フレームに代表値を支配させないために使う。"""
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    return float(np.percentile(finite, q)) if finite.size else float(default)
+
+
+def _robust_window_median(values, center, radius, valid_mask=None, default=np.nan):
+    arr = np.asarray(values, dtype=float)
+    n = len(arr)
+    if n == 0:
+        return float(default)
+    center = int(np.clip(center, 0, n - 1))
+    lo = max(0, center - int(radius))
+    hi = min(n, center + int(radius) + 1)
+    sec = arr[lo:hi].copy()
+    if valid_mask is not None:
+        mask = np.asarray(valid_mask, dtype=bool)[lo:hi]
+        sec[~mask] = np.nan
+    value = _safe_nanmedian(sec, default=np.nan)
+    if np.isfinite(value):
+        return value
+    fallback = arr[center]
+    return float(fallback) if np.isfinite(fallback) else float(default)
+
+
 def interpolate_landmarks(landmark_array, valid_mask):
     result = np.asarray(landmark_array, dtype=float).copy()
     valid_mask = np.asarray(valid_mask, dtype=bool)
@@ -674,90 +700,181 @@ def _body_center_proxy(xy):
 
 
 def calculate_features(world, norm, fps, impact_frame, stance_frame, onset_frame, batter_side, valid_mask, image_aspect_ratio=1.0):
+    """ver.10.0 hotfix: 1フレームの外れ値で代表値が暴れないよう、時間窓とrobust統計を使う。"""
     valid = np.asarray(valid_mask, dtype=bool)
-    shoulder_width_world = max(float(np.linalg.norm(world[stance_frame, LEFT_SHOULDER, :3] - world[stance_frame, RIGHT_SHOULDER, :3])), 1e-6)
+    n = len(world)
+    fps = max(float(fps), 1e-6)
+    radius = max(1, int(round(0.05 * fps)))
+
     # normalized x/y は単位が異なるため、xを幅/高さ比で補正してから2D距離・角度を計算する。
     xy = np.asarray(norm[:, :, :2], dtype=float).copy()
     xy[:, :, 0] *= max(float(image_aspect_ratio), 1e-6)
-    shoulder_width_2d = max(float(np.linalg.norm(xy[stance_frame, LEFT_SHOULDER] - xy[stance_frame, RIGHT_SHOULDER])), 1e-5)
+
+    # 主要関節のvisibilityが低い実測フレームは、特徴量の代表値計算から除外する。
+    core_joints = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]
+    try:
+        core_visibility = np.nanmean(np.asarray(norm[:, core_joints, 3], dtype=float), axis=1)
+        core_valid = valid & np.isfinite(core_visibility) & (core_visibility >= 0.50)
+    except Exception:
+        core_valid = valid.copy()
+    if core_valid.sum() < max(4, int(round(0.12 * fps))):
+        core_valid = valid.copy()
+
+    # 肩幅は1フレーム固定ではなく、構え周辺の中央値を使う。
+    world_shoulder_width = np.linalg.norm(
+        world[:, LEFT_SHOULDER, :3] - world[:, RIGHT_SHOULDER, :3], axis=1
+    ).astype(float)
+    shoulder_width_world = _robust_window_median(
+        world_shoulder_width, stance_frame, radius, core_valid, default=1e-6
+    )
+    shoulder_width_world = max(float(shoulder_width_world), 1e-6)
+
+    shoulder_width_2d_series = np.linalg.norm(
+        xy[:, LEFT_SHOULDER, :2] - xy[:, RIGHT_SHOULDER, :2], axis=1
+    ).astype(float)
+    shoulder_width_2d = _robust_window_median(
+        shoulder_width_2d_series, stance_frame, radius, core_valid, default=1e-5
+    )
+    shoulder_width_2d = max(float(shoulder_width_2d), 1e-5)
 
     lead_hip, lead_knee, lead_ankle = (
         (LEFT_HIP, LEFT_KNEE, LEFT_ANKLE) if batter_side == "右打者"
         else (RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE)
     )
 
-    sh_angles = np.array([horizontal_line_angle(f[LEFT_SHOULDER], f[RIGHT_SHOULDER]) for f in world])
-    hip_angles = np.array([horizontal_line_angle(f[LEFT_HIP], f[RIGHT_HIP]) for f in world])
+    sh_angles = np.array([horizontal_line_angle(f[LEFT_SHOULDER], f[RIGHT_SHOULDER]) for f in world], dtype=float)
+    hip_angles = np.array([horizontal_line_angle(f[LEFT_HIP], f[RIGHT_HIP]) for f in world], dtype=float)
     sh_unwrap = np.degrees(np.unwrap(np.radians(sh_angles)))
     hip_unwrap = np.degrees(np.unwrap(np.radians(hip_angles)))
 
-    shoulder_opening = abs(float(sh_unwrap[impact_frame] - sh_unwrap[stance_frame]))
+    # 3D推定の瞬間的なz方向ノイズを抑える。
+    smooth_window = max(3, int(round(0.08 * fps)))
+    if smooth_window % 2 == 0:
+        smooth_window += 1
+    sh_for_smooth = sh_unwrap.copy()
+    hip_for_smooth = hip_unwrap.copy()
+    sh_for_smooth[~core_valid] = np.nan
+    hip_for_smooth[~core_valid] = np.nan
+    sh_smooth = pd.Series(sh_for_smooth).rolling(smooth_window, center=True, min_periods=1).median().to_numpy()
+    hip_smooth = pd.Series(hip_for_smooth).rolling(smooth_window, center=True, min_periods=1).median().to_numpy()
 
+    # 1. 身体を開くな: 構え/インパクトの単一フレームではなく各±0.05秒の中央値。
+    stance_sh = _robust_window_median(sh_smooth, stance_frame, radius, core_valid, default=sh_unwrap[stance_frame])
+    impact_sh = _robust_window_median(sh_smooth, impact_frame, radius, core_valid, default=sh_unwrap[impact_frame])
+    shoulder_opening = abs(float(impact_sh - stance_sh))
+
+    # 2. 割れ: 「最大1フレーム」を廃止し、インパクト前の上位傾向(90パーセンタイル)を代表値にする。
     pre_start = max(stance_frame, impact_frame - int(round(0.7 * fps)))
-    separation = circular_angle_difference(sh_angles, hip_angles).astype(float)
-    sec = separation[pre_start:impact_frame + 1]
-    sec_valid = valid[pre_start:impact_frame + 1]
-    sec[~sec_valid] = np.nan
-    hip_shoulder_separation = _safe_nanmax(sec)
+    separation = circular_angle_difference(sh_smooth, hip_smooth).astype(float)
+    sep_sec = separation[pre_start:impact_frame + 1].copy()
+    sep_mask = core_valid[pre_start:impact_frame + 1]
+    sep_sec[~sep_mask] = np.nan
+    finite_sep = sep_sec[np.isfinite(sep_sec)]
+    if finite_sep.size >= 5:
+        hip_shoulder_separation = _safe_nanpercentile(finite_sep, 90)
+    else:
+        hip_shoulder_separation = _safe_nanmedian(finite_sep)
 
     shoulder_centers_world = midpoint(world[:, LEFT_SHOULDER, :3], world[:, RIGHT_SHOULDER, :3])
     hip_centers_world = midpoint(world[:, LEFT_HIP, :3], world[:, RIGHT_HIP, :3])
     hand_centers_world = midpoint(world[:, LEFT_WRIST, :3], world[:, RIGHT_WRIST, :3])
     torso_world = midpoint(shoulder_centers_world, hip_centers_world)
-    hand_torso_distance = float(np.linalg.norm(hand_centers_world[impact_frame] - torso_world[impact_frame]) / shoulder_width_world)
+
+    # 3. 手-体幹距離もインパクト周辺中央値。
+    hand_ratio = np.linalg.norm(hand_centers_world - torso_world, axis=1) / np.maximum(world_shoulder_width, 1e-6)
+    hand_valid = valid.copy()
+    try:
+        wrist_vis = np.nanmean(norm[:, [LEFT_WRIST, RIGHT_WRIST], 3], axis=1)
+        hand_valid &= np.isfinite(wrist_vis) & (wrist_vis >= 0.45)
+    except Exception:
+        pass
+    hand_torso_distance = _robust_window_median(
+        hand_ratio, impact_frame, radius, hand_valid, default=hand_ratio[impact_frame]
+    )
 
     shoulder_centers_2d = midpoint(xy[:, LEFT_SHOULDER, :2], xy[:, RIGHT_SHOULDER, :2])
     hip_centers_2d = midpoint(xy[:, LEFT_HIP, :2], xy[:, RIGHT_HIP, :2])
     torso_2d = midpoint(shoulder_centers_2d, hip_centers_2d)
 
+    # 4. 軸移動: max-minではなく5〜95パーセンタイル幅で単発ノイズを除外。
     torso_x = torso_2d[stance_frame:impact_frame + 1, 0].astype(float)
-    torso_x[~valid[stance_frame:impact_frame + 1]] = np.nan
-    axis_sway = float((_safe_nanmax(torso_x) - np.nanmin(torso_x[np.isfinite(torso_x)])) / shoulder_width_2d) if np.isfinite(torso_x).any() else np.nan
+    torso_mask = core_valid[stance_frame:impact_frame + 1]
+    torso_x[~torso_mask] = np.nan
+    finite_torso = torso_x[np.isfinite(torso_x)]
+    axis_sway = (
+        (_safe_nanpercentile(finite_torso, 95) - _safe_nanpercentile(finite_torso, 5)) / shoulder_width_2d
+        if finite_torso.size else np.nan
+    )
 
-    front_knee_angle = joint_angle(world[impact_frame, lead_hip], world[impact_frame, lead_knee], world[impact_frame, lead_ankle])
+    # 5. 前脚膝角度: インパクト±0.05秒の中央値。
+    knee_angles = np.full(n, np.nan, dtype=float)
+    knee_valid = valid.copy()
+    for i in range(n):
+        if not valid[i]:
+            continue
+        knee_angles[i] = joint_angle(world[i, lead_hip], world[i, lead_knee], world[i, lead_ankle])
+    front_knee_angle = _robust_window_median(
+        knee_angles, impact_frame, radius, knee_valid, default=knee_angles[impact_frame]
+    )
 
+    # 6. 頭部移動: 構え頭位置も周辺中央値、最大値ではなく95パーセンタイル。
     head2d = xy[:, NOSE, :2]
+    s0, s1 = max(0, stance_frame-radius), min(n, stance_frame+radius+1)
+    stance_head_pool = head2d[s0:s1][valid[s0:s1]]
+    stance_head = np.nanmedian(stance_head_pool, axis=0) if len(stance_head_pool) else head2d[stance_frame]
     head_sec = head2d[stance_frame:impact_frame + 1]
-    head_dist = np.linalg.norm(head_sec - head2d[stance_frame], axis=1).astype(float)
+    head_dist = np.linalg.norm(head_sec - stance_head, axis=1).astype(float)
     head_dist[~valid[stance_frame:impact_frame + 1]] = np.nan
-    head_movement = _safe_nanmax(head_dist) / shoulder_width_2d
+    head_movement = _safe_nanpercentile(head_dist, 95) / shoulder_width_2d
 
-    # v10.0の重要修正: 体重移動はWorld座標でなく画像上の骨盤中心の絶対移動を使う。
-    weight_transfer_signed = float((hip_centers_2d[impact_frame, 0] - hip_centers_2d[stance_frame, 0]) / shoulder_width_2d)
+    # 7. 体重移動: 画像上の骨盤中心を構え/インパクト各窓の中央値で比較。
+    sx0, sx1 = max(0, stance_frame-radius), min(n, stance_frame+radius+1)
+    ix0, ix1 = max(0, impact_frame-radius), min(n, impact_frame+radius+1)
+    stance_hip_x = _safe_nanmedian(hip_centers_2d[sx0:sx1, 0][core_valid[sx0:sx1]], hip_centers_2d[stance_frame, 0])
+    impact_hip_x = _safe_nanmedian(hip_centers_2d[ix0:ix1, 0][core_valid[ix0:ix1]], hip_centers_2d[impact_frame, 0])
+    weight_transfer_signed = float((impact_hip_x - stance_hip_x) / shoulder_width_2d)
     weight_transfer = abs(weight_transfer_signed)
 
-    hip_velocity = _masked_angle_velocity(hip_angles, fps, valid)
+    # 8. 腰回転速度: 単一最大値ではなく平滑化後の90パーセンタイル。
+    hip_velocity = _masked_angle_velocity(hip_smooth, fps, core_valid)
+    shoulder_velocity = _masked_angle_velocity(sh_smooth, fps, core_valid)
+    hip_speed_smoothed = moving_average(np.abs(hip_velocity), max(3, int(round(0.06 * fps))))
+    shoulder_speed_smoothed = moving_average(np.abs(shoulder_velocity), max(3, int(round(0.06 * fps))))
     vel_start = max(stance_frame, impact_frame - int(round(0.5 * fps)))
-    vel_end = min(len(hip_velocity), impact_frame + int(round(0.15 * fps)) + 1)
-    hip_rotation_speed = _safe_nanmax(np.abs(hip_velocity[vel_start:vel_end]))
+    vel_end = min(n, impact_frame + int(round(0.15 * fps)) + 1)
+    hip_rotation_speed = _safe_nanpercentile(hip_speed_smoothed[vel_start:vel_end], 90)
+    shoulder_rotation_speed = _safe_nanpercentile(shoulder_speed_smoothed[vel_start:vel_end], 90)
 
     # ---- 新しい補助指標 ----
-    shoulder_velocity = _masked_angle_velocity(sh_angles, fps, valid)
-    shoulder_rotation_speed = _safe_nanmax(np.abs(shoulder_velocity[vel_start:vel_end]))
-
     body_center = _body_center_proxy(xy)
-    body_shift = float(np.linalg.norm(body_center[impact_frame] - body_center[stance_frame]) / shoulder_width_2d)
-    body_speed = _masked_speed(body_center, fps, valid) / shoulder_width_2d
-    body_speed_peak = _safe_nanmax(body_speed[max(stance_frame, onset_frame):impact_frame + 1])
+    stance_body_pool = body_center[sx0:sx1][core_valid[sx0:sx1]]
+    impact_body_pool = body_center[ix0:ix1][core_valid[ix0:ix1]]
+    stance_body = np.nanmedian(stance_body_pool, axis=0) if len(stance_body_pool) else body_center[stance_frame]
+    impact_body = np.nanmedian(impact_body_pool, axis=0) if len(impact_body_pool) else body_center[impact_frame]
+    body_shift = float(np.linalg.norm(impact_body - stance_body) / shoulder_width_2d)
+    body_speed = _masked_speed(body_center, fps, core_valid) / shoulder_width_2d
+    body_speed = moving_average(body_speed, max(3, int(round(0.06 * fps))))
+    body_speed_peak = _safe_nanpercentile(body_speed[max(stance_frame, onset_frame):impact_frame + 1], 90)
 
-    # 体幹側屈proxy: 画像上の肩中心→骨盤中心ベクトルの鉛直からの傾き。
     torso_vec = shoulder_centers_2d - hip_centers_2d
     torso_side_angles = np.degrees(np.arctan2(torso_vec[:, 0], -torso_vec[:, 1]))
-    torso_side_bend_impact = float(torso_side_angles[impact_frame])
-    torso_side_bend_change = abs(float(torso_side_angles[impact_frame] - torso_side_angles[stance_frame]))
+    torso_side_bend_impact = _robust_window_median(torso_side_angles, impact_frame, radius, core_valid, torso_side_angles[impact_frame])
+    torso_side_bend_stance = _robust_window_median(torso_side_angles, stance_frame, radius, core_valid, torso_side_angles[stance_frame])
+    torso_side_bend_change = abs(float(torso_side_bend_impact - torso_side_bend_stance))
 
     pelvis_tilt_angles = np.degrees(np.arctan2(
         xy[:, RIGHT_HIP, 1] - xy[:, LEFT_HIP, 1],
         xy[:, RIGHT_HIP, 0] - xy[:, LEFT_HIP, 0],
     ))
-    pelvis_tilt_impact = float(pelvis_tilt_angles[impact_frame])
-    pelvis_tilt_change = abs(float(pelvis_tilt_angles[impact_frame] - pelvis_tilt_angles[stance_frame]))
+    pelvis_tilt_impact = _robust_window_median(pelvis_tilt_angles, impact_frame, radius, core_valid, pelvis_tilt_angles[impact_frame])
+    pelvis_tilt_stance = _robust_window_median(pelvis_tilt_angles, stance_frame, radius, core_valid, pelvis_tilt_angles[stance_frame])
+    pelvis_tilt_change = abs(float(pelvis_tilt_impact - pelvis_tilt_stance))
 
-    # 運動連鎖: インパクト前0.6秒〜直後0.1秒の骨盤/肩速度ピーク時刻差。
+    # 運動連鎖ピークも平滑化後の速度を使う。
     chain_start = max(0, impact_frame - int(round(0.60 * fps)))
-    chain_end = min(len(world), impact_frame + int(round(0.10 * fps)) + 1)
-    hip_abs = np.abs(hip_velocity[chain_start:chain_end])
-    sh_abs = np.abs(shoulder_velocity[chain_start:chain_end])
+    chain_end = min(n, impact_frame + int(round(0.10 * fps)) + 1)
+    hip_abs = hip_speed_smoothed[chain_start:chain_end]
+    sh_abs = shoulder_speed_smoothed[chain_start:chain_end]
     hip_peak_frame = chain_start + int(np.nanargmax(hip_abs)) if np.isfinite(hip_abs).any() else impact_frame
     shoulder_peak_frame = chain_start + int(np.nanargmax(sh_abs)) if np.isfinite(sh_abs).any() else impact_frame
     sequence_delay_ms = float((shoulder_peak_frame - hip_peak_frame) / fps * 1000.0)
@@ -788,7 +905,6 @@ def calculate_features(world, norm, fps, impact_frame, stance_frame, onset_frame
         "hip_to_shoulder_peak_delay_ms": sequence_delay_ms,
         "swing_time_sec": swing_time_sec,
     }
-
 
 def _draw_pose_on_frame(frame, norm):
     h, w = frame.shape[:2]
@@ -1122,10 +1238,11 @@ def similarity_score(reference_value, target_value, tolerance):
     if not np.isfinite(reference_value) or not np.isfinite(target_value):
         return np.nan
     diff = abs(float(target_value) - float(reference_value))
-    # v10: 測定ノイズで極端な0点に落ちにくいよう、指数をやや緩やかに。
     z = diff / max(float(tolerance), 1e-9)
-    score = 100.0 * math.exp(-0.5 * (z ** 1.6))
-    return float(np.clip(score, 0, 100))
+    # 1項目だけが数度の推定誤差で0点近くへ崩れるのを防ぐ飽和型スコア。
+    # 差=toleranceで約61点、2倍で約28点、3倍で約15点。
+    score = 100.0 / (1.0 + (z / 1.25) ** 2.0)
+    return float(np.clip(score, 0.0, 100.0))
 
 
 def build_score_table(reference_analysis, target_analysis, selected_names):

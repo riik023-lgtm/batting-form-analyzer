@@ -498,12 +498,20 @@ else:
         st.header("6. 解析結果")
         st.metric("フォーム類似度", f"{result['overall_score']:.1f} / 100")
         c1, c2 = st.columns(2)
-        c1.metric("最も近い項目", result["best_item"], f"{result['best_score']:.1f}点")
-        c2.metric("差が大きい項目", result["lowest_item"], f"{result['lowest_score']:.1f}点")
+        with c1:
+            st.metric("最も近い項目", result["best_item"])
+            st.caption(f"類似度 {result['best_score']:.1f}点")
+        with c2:
+            st.metric("差が大きい項目", result["lowest_item"])
+            st.caption(f"類似度 {result['lowest_score']:.1f}点")
 
         q1, q2 = st.columns(2)
-        q1.metric("解析信頼度: 比較選手", f"{ref.quality_score:.1f}", ref.quality_label)
-        q2.metric("解析信頼度: 自分", f"{tar.quality_score:.1f}", tar.quality_label)
+        with q1:
+            st.metric("解析信頼度: 比較選手", f"{ref.quality_score:.1f} / 100")
+            st.caption(f"判定: {ref.quality_label}")
+        with q2:
+            st.metric("解析信頼度: 自分", f"{tar.quality_score:.1f} / 100")
+            st.caption(f"判定: {tar.quality_label}")
 
         st.markdown("#### 項目別結果")
         st.dataframe(result["score_dataframe"], use_container_width=True, hide_index=True)
