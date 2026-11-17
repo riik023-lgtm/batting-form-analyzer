@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-APP_VERSION = "10.0"
+APP_VERSION = "10.1"
 DATA_ROOT = Path(
     os.environ.get(
         "BFA_DATA_DIR",
@@ -192,7 +192,7 @@ def import_player_bundle(raw: bytes) -> Dict[str, Any]:
         raise ValueError("選手ファイルを読み込めませんでした。") from exc
 
     if payload.get("format") != "BFA_PLAYER_BUNDLE":
-        raise ValueError("このファイルはver.10.0の選手ファイルではありません。")
+        raise ValueError("このファイルは対応する選手ファイルではありません。")
 
     incoming = payload.get("player")
     if not isinstance(incoming, dict) or not incoming.get("name"):
@@ -218,7 +218,9 @@ def analysis_history_dataframe(player: Dict[str, Any]) -> pd.DataFrame:
         row = {
             "解析日時": record.get("created_at", ""),
             "比較対象": record.get("reference_name", "比較選手"),
-            "フォーム類似度": record.get("overall_score"),
+            "比較結果": record.get("overall_comparison_label", ""),
+            "平均差尺度": record.get("mean_normalized_difference"),
+            "旧フォーム類似度": record.get("overall_score"),
             "解析信頼度": record.get("target_quality"),
             "身体負担判定": record.get("body_load_label", ""),
         }

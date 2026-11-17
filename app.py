@@ -15,7 +15,7 @@ import risk_analysis
 import storage
 from pdf_report import build_pdf_report
 
-APP_VERSION = "10.0"
+APP_VERSION = "10.1"
 APP_URL = "https://batting-form-analyzer.streamlit.app/"
 
 st.set_page_config(
@@ -36,11 +36,11 @@ st.markdown(
 )
 
 st.title(f"打撃フォーム分析 ver.{APP_VERSION}")
-st.caption("比較選手と自分の打撃動画を比較し、フォーム類似度・身体負担関連動作・改善ポイントを表示します。")
+st.caption("比較選手と自分の打撃動画を比較し、動作の違い・身体負担に関連する動作・改善ポイントを表示します。")
 st.info(
-    "点数は『比較選手とのフォーム類似度』です。フォームの優劣や医学的な怪我発生確率ではありません。"
+    "ver.10.1では100点評価を主表示にせず、比較選手との差を「方向・実測値・4段階の近さ」で示します。フォームの優劣や医学的な診断ではありません。"
 )
-st.link_button("🔗 打撃フォーム分析 ver.10.0 を開く・共有する", APP_URL, use_container_width=True)
+st.link_button("🔗 打撃フォーム分析 ver.10.1 を開く・共有する", APP_URL, use_container_width=True)
 st.caption(f"共有URL: {APP_URL}")
 
 # ---------------------------- session ----------------------------
@@ -129,7 +129,7 @@ def _import_player(raw):
         return storage.import_player_bundle(raw)
     payload = json.loads(raw.decode("utf-8"))
     if payload.get("format") != "BFA_PLAYER_BUNDLE":
-        raise ValueError("ver.10.0の選手ファイルではありません。")
+        raise ValueError("対応する選手ファイルではありません。")
     p = deepcopy(payload.get("player", {}))
     if not p.get("name"):
         raise ValueError("選手データが壊れています。")
@@ -151,7 +151,9 @@ def _history_df(player):
         row = {
             "解析日時": r.get("created_at", ""),
             "比較対象": r.get("reference_name", "比較選手"),
-            "フォーム類似度": r.get("overall_score"),
+            "比較結果": r.get("overall_comparison_label", ""),
+            "平均差尺度": r.get("mean_normalized_difference"),
+            "旧フォーム類似度": r.get("overall_score"),
             "解析信頼度": r.get("target_quality"),
             "身体負担判定": r.get("body_load_label", ""),
         }
@@ -244,12 +246,13 @@ if page == "選手ファイル":
         else:
             st.markdown("#### 解析履歴")
             st.dataframe(hist, use_container_width=True, hide_index=True)
-            if "フォーム類似度" in hist.columns:
-                chart = hist[["解析日時", "フォーム類似度"]].copy()
+            if "平均差尺度" in hist.columns:
+                chart = hist[["解析日時", "平均差尺度"]].copy()
                 chart["解析日時"] = pd.to_datetime(chart["解析日時"], errors="coerce")
-                chart = chart.dropna(subset=["解析日時"]).set_index("解析日時")
+                chart = chart.dropna(subset=["解析日時", "平均差尺度"]).set_index("解析日時")
                 if not chart.empty:
-                    st.markdown("#### フォーム類似度の推移")
+                    st.markdown("#### 比較対象との差の推移")
+                    st.caption("0に近いほど、その回の比較対象に近い動きです。比較対象が変わる場合は単純な成長曲線としては解釈しないでください。")
                     st.line_chart(chart)
 
             score_columns = [name for name in engine.FEATURES if name in hist.columns]
@@ -298,6 +301,7 @@ else:
             feature_names,
             default=feature_names[:5],
             max_selections=5,
+            format_func=lambda x: engine.FEATURES[x].get("display_name", x),
         )
         st.caption(f"選択中: {len(selected_features)} / 5")
         reference_name = st.text_input("比較選手名・比較対象（任意）", value="比較選手")
@@ -313,7 +317,7 @@ else:
     if reference_file is not None and target_file is not None:
         st.header("3. 打者の解析範囲")
         st.info(
-            "ver.10.0ではスマホで細いスライダーを合わせる必要を減らしました。"
+            "ver.10.1ではスマホで細いスライダーを合わせる必要を減らしました。"
             "まず『自動で打者位置を探す』を使い、合わない時だけ左・中央・右のプリセットか詳細調整を使ってください。"
         )
 
@@ -439,7 +443,7 @@ else:
         st.header("5. インパクト位置を確認")
         st.warning(
             "バットとボールを直接検出していないため、インパクトは身体動作からの推定です。"
-            "ver.10.0では手首速度だけでなく肩・骨盤回転も使い、候補を最大3つ表示します。"
+            "ver.10.1では手首速度だけでなく肩・骨盤回転も使い、候補を最大3つ表示します。"
         )
 
         def impact_selector(label, analysis, prefix):
@@ -496,77 +500,109 @@ else:
         tar = result["target_analysis"]
 
         st.header("6. 解析結果")
-        st.metric("フォーム類似度", f"{result['overall_score']:.1f} / 100")
+        overall_label = result.get("overall_comparison_label", "評価保留")
+        st.markdown(f"### 比較選手との動作傾向：**{overall_label}**")
+        st.caption(
+            "これはフォームの良し悪しではなく、今回選んだ5項目が比較選手とどの程度近いかをまとめた表示です。"
+            "100点換算は内部互換用にのみ残し、主評価には使用しません。"
+        )
+
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("最も近い項目", result["best_item"])
-            st.caption(f"類似度 {result['best_score']:.1f}点")
+            st.markdown("**最も近い動き**")
+            st.subheader(result["best_item"])
         with c2:
-            st.metric("差が大きい項目", result["lowest_item"])
-            st.caption(f"類似度 {result['lowest_score']:.1f}点")
+            st.markdown("**最も違う動き**")
+            st.subheader(result["lowest_item"])
 
         q1, q2 = st.columns(2)
         with q1:
             st.metric("解析信頼度: 比較選手", f"{ref.quality_score:.1f} / 100")
-            st.caption(f"判定: {ref.quality_label}")
+            st.caption(f"骨格推定品質: {ref.quality_label}")
         with q2:
             st.metric("解析信頼度: 自分", f"{tar.quality_score:.1f} / 100")
-            st.caption(f"判定: {tar.quality_label}")
+            st.caption(f"骨格推定品質: {tar.quality_label}")
+        st.caption("解析信頼度だけは0〜100を使用します。これはフォーム評価ではなく、骨格推定をどの程度信用できるかの品質指標です。")
 
-        st.markdown("#### 項目別結果")
-        st.dataframe(result["score_dataframe"], use_container_width=True, hide_index=True)
+        st.markdown("#### 5項目の比較")
+        for _, row in result["score_dataframe"].iterrows():
+            level = row["比較判定"]
+            with st.container(border=True):
+                st.markdown(f"### {row['表示名']}　—　{level}")
+                st.write(f"**比較選手** {row['比較選手表示']}　→　**自分** {row['自分表示']}")
+                st.write(f"**差の方向:** {row['差の方向']}")
+                st.caption(row["計測内容"])
 
-        st.markdown("#### ver.10.0 追加指標")
-        extra_keys = {
-            "スイング開始→インパクト(s)": "swing_time_sec",
-            "身体中心移動proxy": "body_center_shift_proxy",
-            "身体中心速度proxy": "body_center_speed_proxy",
-            "体幹側屈変化(deg)": "torso_side_bend_change_deg",
-            "骨盤傾斜変化(deg)": "pelvis_tilt_change_deg",
-            "骨盤→肩ピーク時間差(ms)": "hip_to_shoulder_peak_delay_ms",
-            "左手首アライメントproxy(deg)": "left_wrist_alignment_proxy_deg",
-            "右手首アライメントproxy(deg)": "right_wrist_alignment_proxy_deg",
-        }
-        extra_table = []
-        for label, key in extra_keys.items():
-            extra_table.append({
-                "指標": label,
-                "比較選手": round(float(ref.extra_metrics.get(key, float("nan"))), 3),
-                "自分": round(float(tar.extra_metrics.get(key, float("nan"))), 3),
-            })
-        st.dataframe(pd.DataFrame(extra_table), use_container_width=True, hide_index=True)
-        st.caption("身体中心は画像上のproxyです。力学的な真の身体重心や地面反力を測定したものではありません。")
+        diff_chart = output_dir / "graphs" / "比較選手との差の方向.png"
+        if diff_chart.exists():
+            st.markdown("#### 差の方向をまとめて見る")
+            st.image(str(diff_chart), use_container_width=True)
+            st.caption("中央の0が比較選手です。左右は『良い／悪い』ではなく、比較選手より小さい／大きい方向を示します。")
 
-        radar = output_dir / "graphs" / "打撃フォーム比較レーダーチャート.png"
-        bar = output_dir / "graphs" / "評価項目別類似度棒グラフ.png"
-        if radar.exists():
-            st.image(str(radar), caption="フォーム比較レーダーチャート", use_container_width=True)
-        if bar.exists():
-            st.image(str(bar), caption="項目別類似度", use_container_width=True)
+        with st.expander("ver.10.1 追加指標を見る"):
+            extra_keys = {
+                "スイング開始→インパクト(s)": "swing_time_sec",
+                "身体中心移動proxy": "body_center_shift_proxy",
+                "身体中心速度proxy": "body_center_speed_proxy",
+                "体幹側屈変化(deg)": "torso_side_bend_change_deg",
+                "骨盤傾斜変化(deg)": "pelvis_tilt_change_deg",
+                "骨盤→肩ピーク時間差(ms)": "hip_to_shoulder_peak_delay_ms",
+                "左手首アライメントproxy(deg)": "left_wrist_alignment_proxy_deg",
+                "右手首アライメントproxy(deg)": "right_wrist_alignment_proxy_deg",
+            }
+            extra_table = []
+            for label, key in extra_keys.items():
+                extra_table.append({
+                    "指標": label,
+                    "比較選手": round(float(ref.extra_metrics.get(key, float("nan"))), 3),
+                    "自分": round(float(tar.extra_metrics.get(key, float("nan"))), 3),
+                })
+            st.dataframe(pd.DataFrame(extra_table), use_container_width=True, hide_index=True)
+            st.caption("身体中心は画像上のproxyです。力学的な真の身体重心や地面反力を測定したものではありません。")
 
-        st.header("7. 身体負担関連動作")
+        st.header("7. 身体負担に関連する動作の確認")
         body = result["body_load"]
-        st.write(f"**総合判定: {body['overall_label']}**")
-        st.dataframe(body["regions"], use_container_width=True, hide_index=True)
+        st.markdown(f"### 今回の確認結果：**{body['overall_label']}**")
+        st.caption("怪我の予測ではありません。先行研究で議論される動作と、今回の比較差を照合した参考表示です。")
+        for _, row in body["regions"].iterrows():
+            with st.container(border=True):
+                st.markdown(f"**{row['部位']}：{row['判定']}**")
+                st.write(f"観測した動き: {row['主な計測proxy']}")
+                st.caption(row['根拠と注意'])
         st.caption(body["limitations"])
 
-        st.header("8. 改善ポイント・練習")
-        st.dataframe(result["advice_dataframe"], use_container_width=True, hide_index=True)
-        st.markdown("#### 先行研究を参考にした追加アドバイス")
+        st.header("8. 今回優先して確認したいポイント")
+        advice_df = result["advice_dataframe"]
+        for i, row in advice_df.iterrows():
+            with st.container(border=True):
+                st.markdown(f"### {i+1}. {row['観点']}　—　{row['比較判定']}")
+                st.markdown("**比較結果**")
+                st.write(row["比較結果"])
+                st.markdown("**動作の特徴**")
+                st.write(row["動作の特徴"])
+                st.markdown("**改善の方向性**")
+                st.write(row["改善の方向性"])
+                st.markdown("**練習例**")
+                st.write(row["練習例"])
+                st.caption(f"研究上の位置づけ: {row['研究上の位置づけ']}")
+
         research_df = result["research_advice"]
-        for _, row in research_df.iterrows():
-            with st.expander(row["観点"], expanded=True):
-                st.write(row["検出内容"])
-                st.write(f"**改善:** {row['改善アドバイス']}")
-                st.write(f"**練習例:** {row['練習例']}")
-                st.caption(f"参考: {row['参考研究']}")
-                st.link_button("参考研究を開く", row["リンク"])
+        if research_df is not None and not research_df.empty:
+            with st.expander("先行研究から見る追加の観点", expanded=False):
+                for _, row in research_df.iterrows():
+                    st.markdown(f"**{row['観点']}**")
+                    st.write(row["検出内容"])
+                    st.write(f"改善の考え方: {row['改善アドバイス']}")
+                    st.write(f"練習例: {row['練習例']}")
+                    st.caption(f"参考研究: {row['参考研究']}")
+                    st.link_button("参考研究を開く", row["リンク"])
+                    st.divider()
 
         st.header("9. 保存")
         st.download_button(
             "📄 PDFレポートを保存",
             data=bundle["pdf_bytes"],
-            file_name="打撃フォーム分析_ver10.pdf",
+            file_name="打撃フォーム分析_ver10_1.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
@@ -579,14 +615,18 @@ else:
                     "📁 この解析を選手ファイルに保存" if not already_saved else "✅ この解析は選手ファイルに保存済み",
                     type="primary", use_container_width=True, disabled=already_saved,
                 ):
-                    scores = dict(zip(result["score_dataframe"]["評価項目"], result["score_dataframe"]["得点"]))
+                    scores = dict(zip(result["score_dataframe"]["表示名"], result["score_dataframe"]["差の尺度"].abs()))
+                    comparison_levels = dict(zip(result["score_dataframe"]["表示名"], result["score_dataframe"]["比較判定"]))
                     record = {
                         "created_at": _now(),
                         "reference_name": bundle.get("reference_name", "比較選手"),
-                        "overall_score": round(float(result["overall_score"]), 1),
+                        "overall_score": round(float(result["overall_score"]), 1),  # 旧互換
+                        "overall_comparison_label": result.get("overall_comparison_label", ""),
+                        "mean_normalized_difference": round(float(result.get("mean_normalized_difference", float("nan"))), 3),
                         "target_quality": round(float(tar.quality_score), 1),
                         "body_load_label": body["overall_label"],
                         "scores": {k: float(v) for k, v in scores.items()},
+                        "comparison_levels": comparison_levels,
                         "target_features": {k: float(v) for k, v in tar.features.items()},
                         "reference_features": {k: float(v) for k, v in ref.features.items()},
                         "target_extra_metrics": {k: float(v) for k, v in tar.extra_metrics.items()},

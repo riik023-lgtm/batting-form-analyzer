@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 from matplotlib import font_manager
 
-APP_VERSION = "10.0"
+APP_VERSION = "10.1"
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "batting_analysis_output"
 CONVERTED_DIR = OUTPUT_DIR / "converted_videos"
@@ -43,48 +43,72 @@ HAND_MODEL = {
 
 FEATURES = {
     "身体を開くな": {
+        "display_name": "肩の回旋量",
+        "direction_positive": "大きい",
+        "direction_negative": "小さい",
         "key": "shoulder_opening",
         "unit": "degree",
         "description": "構えからインパクトまでの肩の回転量",
         "tolerance": 18.0,
     },
     "割れを作れ": {
+        "display_name": "肩―骨盤捻転差",
+        "direction_positive": "大きい",
+        "direction_negative": "小さい",
         "key": "hip_shoulder_separation",
         "unit": "degree",
         "description": "インパクト前の肩と骨盤の最大捻転差",
         "tolerance": 15.0,
     },
     "ボールを引きつけろ": {
+        "display_name": "手部―体幹距離",
+        "direction_positive": "遠い",
+        "direction_negative": "近い",
         "key": "hand_torso_distance",
         "unit": "shoulder-width ratio",
         "description": "インパクト時の手と体幹中心の距離",
         "tolerance": 0.30,
     },
     "軸をぶらすな": {
+        "display_name": "体幹中心の横移動",
+        "direction_positive": "多い",
+        "direction_negative": "少ない",
         "key": "axis_sway",
         "unit": "shoulder-width ratio",
         "description": "画像座標で見た構え〜インパクトの体幹中心の横移動幅",
         "tolerance": 0.35,
     },
     "壁を作れ": {
+        "display_name": "前脚膝角度",
+        "direction_positive": "伸びている",
+        "direction_negative": "曲がっている",
         "key": "front_knee_angle",
         "unit": "degree",
         "description": "インパクト時の前脚膝角度",
         "tolerance": 20.0,
     },
     "頭を残せ": {
+        "display_name": "頭部移動量",
+        "direction_positive": "多い",
+        "direction_negative": "少ない",
         "key": "head_movement",
         "unit": "shoulder-width ratio",
         "description": "画像座標で見た構え〜インパクトの頭部移動量",
         "tolerance": 0.30,
     },
     "体重移動をしろ": {
+        "display_name": "骨盤中心の水平移動",
+        "direction_positive": "多い",
+        "direction_negative": "少ない",
         "key": "weight_transfer",
         "unit": "shoulder-width ratio",
         "description": "画像座標で見た骨盤中心の構え〜インパクト水平移動量",
         "tolerance": 0.35,
     },
     "腰を使え": {
+        "display_name": "骨盤回転速度",
+        "direction_positive": "速い",
+        "direction_negative": "遅い",
         "key": "hip_rotation_speed",
         "unit": "degree/sec",
         "description": "World座標で見たインパクト前後の最大骨盤回転速度",
@@ -761,7 +785,7 @@ def calculate_features(world, norm, fps, impact_frame, stance_frame, onset_frame
     # 1. 身体を開くな: 構え/インパクトの単一フレームではなく各±0.05秒の中央値。
     stance_sh = _robust_window_median(sh_smooth, stance_frame, radius, core_valid, default=sh_unwrap[stance_frame])
     impact_sh = _robust_window_median(sh_smooth, impact_frame, radius, core_valid, default=sh_unwrap[impact_frame])
-    shoulder_opening = abs(float(impact_sh - stance_sh))
+    shoulder_opening = float(circular_angle_difference(float(impact_sh), float(stance_sh)))
 
     # 2. 割れ: 「最大1フレーム」を廃止し、インパクト前の上位傾向(90パーセンタイル)を代表値にする。
     pre_start = max(stance_frame, impact_frame - int(round(0.7 * fps)))
@@ -1235,152 +1259,209 @@ def analyze_video(video_path, batter_side, prefix, batter_roi=None):
 
 
 def similarity_score(reference_value, target_value, tolerance):
+    """内部互換用の0〜100指標。画面上の主評価には使用しない。"""
     if not np.isfinite(reference_value) or not np.isfinite(target_value):
         return np.nan
     diff = abs(float(target_value) - float(reference_value))
     z = diff / max(float(tolerance), 1e-9)
-    # 1項目だけが数度の推定誤差で0点近くへ崩れるのを防ぐ飽和型スコア。
-    # 差=toleranceで約61点、2倍で約28点、3倍で約15点。
     score = 100.0 / (1.0 + (z / 1.25) ** 2.0)
     return float(np.clip(score, 0.0, 100.0))
+
+
+def comparison_level(normalized_difference):
+    """比較選手との差を4段階で返す。優劣ではなく『近さ』の表示。"""
+    if not np.isfinite(normalized_difference):
+        return "評価保留"
+    z = abs(float(normalized_difference))
+    if z <= 0.50:
+        return "かなり近い"
+    if z <= 1.00:
+        return "やや近い"
+    if z <= 1.75:
+        return "差がある"
+    return "大きく異なる"
+
+
+def overall_comparison_label(score_dataframe):
+    vals = pd.to_numeric(score_dataframe.get("差の尺度"), errors="coerce")
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return "評価保留"
+    return comparison_level(float(np.nanmean(np.abs(vals))))
+
+
+def _feature_value_text(value, unit):
+    if not np.isfinite(value):
+        return "測定困難"
+    v = float(value)
+    if unit == "degree":
+        return f"{v:.1f}°"
+    if unit == "degree/sec":
+        return f"{v:.0f}°/s"
+    if unit == "shoulder-width ratio":
+        return f"肩幅の{v:.2f}倍"
+    return f"{v:.3f}"
 
 
 def build_score_table(reference_analysis, target_analysis, selected_names):
     rows = []
     for name in selected_names:
         cfg = FEATURES[name]
-        ref = reference_analysis.features[cfg["key"]]
-        tar = target_analysis.features[cfg["key"]]
-        score = similarity_score(ref, tar, cfg["tolerance"])
+        ref = float(reference_analysis.features[cfg["key"]])
+        tar = float(target_analysis.features[cfg["key"]])
+        signed = tar - ref
+        tolerance = max(float(cfg["tolerance"]), 1e-9)
+        z_signed = signed / tolerance
+        score = similarity_score(ref, tar, tolerance)
+        if not np.isfinite(signed):
+            direction = "評価保留"
+        elif abs(signed) < tolerance * 0.05:
+            direction = "ほぼ同じ"
+        elif signed > 0:
+            direction = f"比較選手より{cfg['direction_positive']}"
+        else:
+            direction = f"比較選手より{cfg['direction_negative']}"
         rows.append({
-            "評価項目": name,
+            "評価項目": name,  # 保存互換用
+            "表示名": cfg["display_name"],
             "計測内容": cfg["description"],
-            "比較選手": round(float(ref), 3),
-            "自分": round(float(tar), 3),
+            "比較選手": round(ref, 3),
+            "自分": round(tar, 3),
+            "比較選手表示": _feature_value_text(ref, cfg["unit"]),
+            "自分表示": _feature_value_text(tar, cfg["unit"]),
             "単位": cfg["unit"],
-            "差の絶対値": round(abs(float(tar) - float(ref)), 3),
-            "得点": round(float(score), 1),
+            "差": round(signed, 3),
+            "差の絶対値": round(abs(signed), 3),
+            "差の尺度": round(z_signed, 3),
+            "差の方向": direction,
+            "比較判定": comparison_level(z_signed),
+            "得点": round(float(score), 1),  # 旧履歴互換用。UIには出さない
         })
     return pd.DataFrame(rows)
 
 
-def save_radar_chart(df):
-    labels = df["評価項目"].tolist()
-    scores = df["得点"].astype(float).tolist()
-    n = len(labels)
-    angles = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
-    angles_c = angles + angles[:1]
-    fig = plt.figure(figsize=(9, 8))
-    ax = fig.add_subplot(111, polar=True)
-    ax.set_theta_offset(np.pi / 2)
-    ax.set_theta_direction(-1)
-    ax.plot(angles_c, [100] * (n + 1), linestyle="--", marker="o", label="比較選手の基準")
-    ax.plot(angles_c, scores + scores[:1], linewidth=2.5, marker="o", label="自分の類似度")
-    ax.fill(angles_c, scores + scores[:1], alpha=0.20)
-    ax.set_xticks(angles)
-    ax.set_xticklabels(labels, fontsize=11)
-    ax.set_ylim(0, 100)
-    ax.set_title(f"打撃フォーム比較\n総合類似度: {df['得点'].mean():.1f}点", pad=30)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.12))
+def save_difference_direction_chart(df):
+    """比較選手との差の方向だけを示す。異なる単位を許容差で標準化する。"""
+    labels = df["表示名"].tolist()
+    values = df["差の尺度"].astype(float).to_numpy()
+    values = np.clip(values, -3.0, 3.0)
+    fig_h = max(4.2, 0.78 * len(labels) + 1.8)
+    fig, ax = plt.subplots(figsize=(9.5, fig_h))
+    y = np.arange(len(labels))
+    bars = ax.barh(y, values)
+    ax.axvline(0, linewidth=1.4)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=11)
+    ax.invert_yaxis()
+    ax.set_xlim(-3.1, 3.1)
+    ax.set_xticks([-3, -2, -1, 0, 1, 2, 3])
+    ax.set_xticklabels(["大きく小さい", "小さい", "やや小さい", "比較選手", "やや大きい", "大きい", "大きく大きい"], fontsize=9)
+    ax.set_title("比較選手との差の方向", fontsize=15)
+    ax.set_xlabel("各項目の比較尺度（0に近いほど比較選手に近い）", fontsize=10)
+    ax.grid(axis="x", alpha=0.25)
+    for bar, (_, row) in zip(bars, df.iterrows()):
+        x = float(bar.get_width())
+        text = f"{row['差の方向']} / {row['比較判定']}"
+        ha = "left" if x >= 0 else "right"
+        offset = 0.06 if x >= 0 else -0.06
+        ax.text(x + offset, bar.get_y() + bar.get_height()/2, text, va="center", ha=ha, fontsize=8.5)
     plt.tight_layout()
-    plt.savefig(GRAPH_DIR / "打撃フォーム比較レーダーチャート.png", dpi=220, bbox_inches="tight")
+    out = GRAPH_DIR / "比較選手との差の方向.png"
+    plt.savefig(out, dpi=220, bbox_inches="tight")
     plt.close(fig)
+    return out
 
 
-def save_comparison_bar_chart(df):
-    fig = plt.figure(figsize=(9, 6))
-    ax = fig.add_subplot(111)
-    labels = df["評価項目"].tolist()
-    scores = df["得点"].astype(float).tolist()
-    bars = ax.bar(labels, scores)
-    ax.set_ylim(0, 100)
-    ax.set_ylabel("比較選手との類似度（点）")
-    ax.set_title("評価項目別のフォーム類似度")
-    ax.tick_params(axis="x", rotation=20)
-    for bar, score in zip(bars, scores):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height()+2, f"{score:.1f}", ha="center")
-    plt.tight_layout()
-    plt.savefig(GRAPH_DIR / "評価項目別類似度棒グラフ.png", dpi=220, bbox_inches="tight")
-    plt.close(fig)
+def _advice_source_for(name):
+    mapping = {
+        "身体を開くな": "骨盤・肩の回転タイミングに関する研究を参考。回転の大小だけで良否は決めません。",
+        "割れを作れ": "肩―骨盤の相対回旋・運動連鎖に関する研究を参考。捻転差は大きいほど良いとは限りません。",
+        "ボールを引きつけろ": "スイング半径・上肢のエネルギーフロー研究を参考。ただしバット軌道・力学量は動画から直接測定していません。",
+        "軸をぶらすな": "身体中心位置・速度を扱う研究を参考。表示値は画像上のproxyで真の身体重心ではありません。",
+        "壁を作れ": "インパクト再現性に関わる下肢・骨盤姿勢の研究を参考。膝角度単独で優劣は判定しません。",
+        "頭を残せ": "頭部位置は視認性・姿勢安定の補助指標として扱います。",
+        "体重移動をしろ": "身体重心位置・速度を扱う研究を参考。真の重心や地面反力は測定していません。",
+        "腰を使え": "体幹筋形態・骨盤回旋研究を参考。筋力不足や筋量は動画から推定しません。",
+    }
+    return mapping.get(name, "先行研究は補助的な解釈に使用しています。")
 
 
 def generate_improvement_advice(score_df, ref, tar):
+    """差が大きい上位3観点だけを、観測→解釈→改善→練習→根拠の順で返す。"""
+    ranked = score_df.copy()
+    ranked["__magnitude"] = ranked["差の尺度"].astype(float).abs()
+    ranked = ranked.sort_values("__magnitude", ascending=False)
+    ranked = ranked[ranked["比較判定"].isin(["差がある", "大きく異なる"])]
     rows = []
-    scores = dict(zip(score_df["評価項目"], score_df["得点"]))
 
-    def add(category, priority, finding, direction, training, evidence=""):
+    def add(name, row, interpretation, direction, training):
+        cfg = FEATURES[name]
+        diff_text = f"{row['比較選手表示']} → {row['自分表示']}"
         rows.append({
-            "分類": category, "優先度": priority, "検出内容": finding,
-            "改善の方向性": direction, "推奨練習": training, "参考": evidence,
+            "観点": cfg["display_name"],
+            "比較結果": f"{diff_text}（{row['差の方向']}）",
+            "比較判定": row["比較判定"],
+            "動作の特徴": interpretation,
+            "改善の方向性": direction,
+            "練習例": training,
+            "研究上の位置づけ": _advice_source_for(name),
+            "差の尺度": float(abs(row["差の尺度"])),
         })
 
-    for name in score_df["評価項目"]:
-        score = float(scores[name])
-        if score >= 70:
-            continue
-        key = FEATURES[name]["key"]
-        rv, tv = ref.features[key], tar.features[key]
+    for _, row in ranked.head(3).iterrows():
+        name = row["評価項目"]
+        rv = float(row["比較選手"]); tv = float(row["自分"])
         if name == "身体を開くな":
-            add("上半身", "高" if score < 55 else "中",
-                f"肩の回転量が比較選手と{abs(tv-rv):.1f}度異なります。",
-                "骨盤の回転開始と肩の回転開始の順序を確認してください。",
-                "前肩を残したティー打撃、下半身主導の分解素振り",
-                "VICTORY『身体が開く』解説／運動連鎖研究")
+            if tv > rv:
+                interpretation = "構えからインパクトまでの肩の回旋量が比較選手より大きい傾向です。上半身の回転が早い、または回転量そのものが大きい可能性があります。"
+            else:
+                interpretation = "構えからインパクトまでの肩の回旋量が比較選手より小さい傾向です。上半身の回転が抑えられている可能性があります。"
+            direction = "肩だけを増減させるのではなく、骨盤が動き始めてから肩がどのタイミングで追従するかを確認してください。"
+            training = "50〜70%強度の分解ティー打撃。踏み込み→骨盤→胸郭→腕の順をスロー動画で確認。"
         elif name == "割れを作れ":
-            add("捻転差", "高" if score < 55 else "中",
-                f"肩と骨盤の最大捻転差が比較選手と{abs(tv-rv):.1f}度異なります。",
-                "捻りを大きくすること自体ではなく、骨盤→肩への回転の時間差を整えてください。",
-                "ステップドリル、メディシンボール回旋、ゆっくりした連続素振り",
-                "体幹・骨盤回旋に関する先行研究")
+            interpretation = "インパクト前の肩―骨盤捻転差が比較選手と異なります。これは『捻り不足／捻り過ぎ』を単独で断定する値ではありません。"
+            direction = "捻転差の大きさだけでなく、骨盤と肩が回り始める順序と、捻転が解放されるタイミングを合わせることを優先してください。"
+            training = "ステップ後に一度止まる分解ティー、メディシンボール回旋、ゆっくりした連続素振り。"
         elif name == "ボールを引きつけろ":
-            add("手部軌道", "高" if score < 55 else "中",
-                "インパクト時の手と体幹中心の距離が比較選手と異なります。",
-                "手が過度に体から離れる／近づきすぎる動きを確認してください。",
-                "コース別ティー、短いバットでのインサイドアウト練習",
-                "スイング半径・時間に関する研究")
+            interpretation = "インパクト付近の手部―体幹距離が比較選手と異なります。手部軌道や打点の違いが反映されている可能性があります。"
+            direction = "『近いほど良い』とはせず、窮屈さや外回りがないかを動画で確認し、打つコースに応じた手部位置を探してください。"
+            training = "内外角のコース別ティー、短いバットでのコンパクトスイング、同じ打点で3〜5球反復。"
         elif name == "軸をぶらすな":
-            add("姿勢安定", "高" if score < 55 else "中",
-                "画像上の体幹中心の横移動幅が比較選手と異なります。",
-                "身体全体が横へ流れるのか、股関節を中心に回転できているのかを確認してください。",
-                "ノーステップ打撃、軸足固定ティー、スプリットスクワット")
+            interpretation = "構えからインパクトまでの体幹中心の横移動幅が比較選手と異なります。身体全体の流れや回転中心の違いが反映されます。"
+            direction = "横移動をゼロにするのではなく、移動がインパクト直前まで続いていないか、股関節周辺で回転へ移れているかを確認してください。"
+            training = "ノーステップティー、踏み込み後静止ドリル、同じカメラ位置で3〜5球比較。"
         elif name == "壁を作れ":
-            add("前脚", "高" if score < 55 else "中",
-                f"インパクト時の前脚膝角度が比較選手と{abs(tv-rv):.1f}度異なります。",
-                "前脚が早く伸び切る／深く曲がり続けるタイミングを確認してください。",
-                "踏み込み後静止ドリル、スプリットスクワット")
+            interpretation = "インパクト付近の前脚膝角度が比較選手と異なります。前脚が伸びる／曲がるタイミングの違いが反映されています。"
+            direction = "膝角度だけを合わせるのではなく、踏み込み後に骨盤回転を受け止めるタイミングを確認してください。"
+            training = "踏み込み後静止ドリル、低強度ティー、スプリットスクワット。"
         elif name == "頭を残せ":
-            add("頭部安定", "中",
-                "画像上の頭部移動量が比較選手と異なります。",
-                "視線位置と頭部の前突・横流れをスロー動画で確認してください。",
-                "ノーステップ打撃、頭の横に目印を置く素振り")
+            interpretation = "構えからインパクトまでの頭部移動量が比較選手と異なります。身体の並進や体幹姿勢の違いが影響している可能性があります。"
+            direction = "頭を無理に固定せず、インパクトまで視線位置と体幹姿勢が大きく崩れていないかを確認してください。"
+            training = "ノーステップティー、頭の横に目印を置いたスロー素振り。"
         elif name == "体重移動をしろ":
-            add("体重移動proxy", "中",
-                "画像上の骨盤中心の水平移動量が比較選手と異なります。",
-                "移動量だけでなく、インパクトまでに移動が収束しているかを確認してください。",
-                "歩きティー、ステップ打撃、踏み込み後静止ドリル",
-                "身体重心速度・走塁意識条件に関する研究")
+            interpretation = "画像上の骨盤中心の水平移動量が比較選手と異なります。これは体重そのものの移動量ではなく、身体位置のproxyです。"
+            direction = "移動量の大小より、踏み込みからインパクトまでに前方移動が収束し、回転へつながっているかを確認してください。"
+            training = "歩きティー、ステップ打撃、踏み込み後静止ドリル。"
         elif name == "腰を使え":
-            add("骨盤回旋", "高" if score < 55 else "中",
-                "骨盤回転速度が比較選手と異なります。",
-                "筋力不足とは断定せず、骨盤回転の立ち上がりと肩回転との順序を確認してください。",
-                "メディシンボール回旋、ステップ打撃、分解素振り",
-                "体幹筋・骨盤回旋に関する研究")
-
-    delay = tar.extra_metrics.get("hip_to_shoulder_peak_delay_ms", np.nan)
-    ref_delay = ref.extra_metrics.get("hip_to_shoulder_peak_delay_ms", np.nan)
-    if np.isfinite(delay) and np.isfinite(ref_delay) and abs(delay - ref_delay) >= 60:
-        add("運動連鎖", "中",
-            f"骨盤回転速度ピーク→肩回転速度ピークの時間差が比較選手と約{abs(delay-ref_delay):.0f}ms異なります。",
-            "回転の順番とつながりを確認してください。大きい・小さいだけで良否は断定しません。",
-            "50〜70%強度の分解素振り、ステップ→骨盤→肩の順を確認",
-            "上肢へのエネルギー伝達・体幹回旋研究")
+            interpretation = "インパクト前後の骨盤回転速度が比較選手と異なります。筋力差ではなく、回転の立ち上がりやタイミングの違いとして解釈します。"
+            direction = "骨盤回転を速くすることだけを狙わず、肩回転との順序とスムーズな連動を確認してください。"
+            training = "メディシンボール回旋、ステップ打撃、50〜70%強度の分解素振り。"
+        else:
+            continue
+        add(name, row, interpretation, direction, training)
 
     if not rows:
-        add("総合評価", "低", "選択項目では大きな差は検出されませんでした。",
-            "同じ撮影条件で複数スイングを比較し、再現性を確認してください。",
-            "同条件で3〜5スイング撮影")
-    order = {"高": 0, "中": 1, "低": 2}
-    return pd.DataFrame(rows).sort_values("優先度", key=lambda s: s.map(order)).reset_index(drop=True)
+        rows.append({
+            "観点": "全体",
+            "比較結果": "選択した項目では、比較選手との大きな差は検出されませんでした。",
+            "比較判定": "かなり近い／やや近い",
+            "動作の特徴": "単発の1スイングだけでは再現性までは分かりません。",
+            "改善の方向性": "同じ撮影条件で複数回測定し、毎回同じ傾向が出るか確認してください。",
+            "練習例": "同じ条件で3〜5スイング撮影し、履歴で比較。",
+            "研究上の位置づけ": "インパクト再現性研究では複数試技のばらつきを扱っています。",
+            "差の尺度": 0.0,
+        })
+    return pd.DataFrame(rows)
 
 
 def _refresh_result(result, selected_feature_names, batter_side):
@@ -1388,20 +1469,22 @@ def _refresh_result(result, selected_feature_names, batter_side):
     tar = result["target_analysis"]
     score_df = build_score_table(ref, tar, selected_feature_names)
     score_df.to_csv(OUTPUT_DIR / "batting_form_comparison_result.csv", index=False, encoding="utf-8-sig")
-    save_radar_chart(score_df)
-    save_comparison_bar_chart(score_df)
+    save_difference_direction_chart(score_df)
     advice = generate_improvement_advice(score_df, ref, tar)
     advice.to_csv(OUTPUT_DIR / "打撃フォーム改善提案.csv", index=False, encoding="utf-8-sig")
-    overall = float(score_df["得点"].mean())
-    best = score_df.loc[score_df["得点"].idxmax()]
-    low = score_df.loc[score_df["得点"].idxmin()]
+    overall = float(score_df["得点"].mean())  # 旧履歴互換用（UIでは非表示）
+    mean_norm = float(np.nanmean(np.abs(score_df["差の尺度"].astype(float))))
+    best = score_df.loc[score_df["差の尺度"].abs().idxmin()]
+    low = score_df.loc[score_df["差の尺度"].abs().idxmax()]
     result.update({
         "overall_score": overall,
+        "mean_normalized_difference": mean_norm,
+        "overall_comparison_label": overall_comparison_label(score_df),
         "score_dataframe": score_df,
         "advice_dataframe": advice,
-        "best_item": str(best["評価項目"]),
+        "best_item": str(best["表示名"]),
         "best_score": float(best["得点"]),
-        "lowest_item": str(low["評価項目"]),
+        "lowest_item": str(low["表示名"]),
         "lowest_score": float(low["得点"]),
         "selected_feature_names": list(selected_feature_names),
         "batter_side": batter_side,

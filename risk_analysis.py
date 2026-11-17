@@ -73,20 +73,20 @@ def _label_from_change(change, moderate=0.20, high=0.40):
         return "評価困難"
     magnitude = abs(float(change))
     if magnitude >= high:
-        return "注意要素あり"
+        return "要確認"
     if magnitude >= moderate:
-        return "やや注意"
-    return "明確な増大なし"
+        return "少し差あり"
+    return "大きな差は確認されず"
 
 
 def _overall(labels: List[str]):
-    if "注意要素あり" in labels:
-        return "注意要素あり"
-    if "やや注意" in labels:
-        return "やや注意"
+    if "要確認" in labels:
+        return "要確認"
+    if "少し差あり" in labels:
+        return "少し差あり"
     if all(v == "評価困難" for v in labels):
         return "評価困難"
-    return "明確な増大なし"
+    return "大きな差は確認されず"
 
 
 def assess_body_load(reference_analysis, target_analysis, batter_side="右打者") -> Dict:
@@ -157,21 +157,21 @@ def assess_body_load(reference_analysis, target_analysis, batter_side="右打者
     ])
 
     guidance = []
-    if low_back_label in {"やや注意", "注意要素あり"}:
+    if low_back_label in {"少し差あり", "要確認"}:
         guidance.append({
             "部位": "腰部・体幹",
             "改善の方向性": "比較選手との差が大きい体幹側屈・捻転・骨盤回転を個別に確認し、強い捻りや急な制動だけを増やさないでください。",
             "練習例": "50〜70%強度のティー打撃、フォロースルーを途中で止めない連続素振り、スロー動画で体幹傾きを確認",
             "参考": SOURCES["low_back_case"]["title"],
         })
-    if oblique_label in {"やや注意", "注意要素あり"}:
+    if oblique_label in {"少し差あり", "要確認"}:
         guidance.append({
             "部位": "脇腹・腹斜筋周辺",
             "改善の方向性": "筋力不足とは断定せず、骨盤と肩の回転タイミングおよびフォロースルーまでの回転の滑らかさを確認してください。",
             "練習例": "軽いバット→通常バットの段階的スイング、メディシンボール回旋、分解素振り",
             "参考": SOURCES["follow_through"]["title"],
         })
-    if pelvis_label in {"やや注意", "注意要素あり"}:
+    if pelvis_label in {"少し差あり", "要確認"}:
         guidance.append({
             "部位": "骨盤・姿勢",
             "改善の方向性": "骨盤傾斜の変化が大きい場合、単発の良否ではなく同じ撮影条件で複数スイングのばらつきを確認してください。",
@@ -193,7 +193,7 @@ def assess_body_load(reference_analysis, target_analysis, batter_side="右打者
         "guidance": pd.DataFrame(guidance),
         "sources": SOURCES,
         "limitations": (
-            "本判定は医学的診断や怪我発生確率ではありません。単眼動画とMediaPipeから得られる運動学的proxyを、"
+            "この表示は医学的診断や怪我発生確率ではありません。単眼動画とMediaPipeから得られる運動学的proxyを、"
             "比較選手との差および先行研究で論点となった動作と照合した参考情報です。筋力、筋厚、関節トルク、"
             "地面反力、真の身体重心、バットヘッド速度は直接測定していません。"
         ),
@@ -234,8 +234,30 @@ def research_based_advice(reference_analysis, target_analysis) -> pd.DataFrame:
             f"骨盤回転速度ピークから肩回転速度ピークまでの時間差が比較選手と約{abs(tar_delay-ref_delay):.0f}ms異なります。",
             "エネルギー伝達そのものは測定していませんが、骨盤と肩の回転順序をスロー動画で確認してください。",
             "ステップ→骨盤→肩の順を意識した分解素振り、メディシンボール回旋",
-            "upper_limb_energy",
+            "trunk_muscle",
         )
+
+    # 上肢エネルギーフロー研究では手関節を含む上肢末端でのエネルギー伝達が論点となる。
+    # 本アプリは力学的エネルギーを測れないため、手首アライメントproxyの差だけを補助表示する。
+    wrist_pairs = [
+        ("left_wrist_alignment_proxy_deg", "左手首"),
+        ("right_wrist_alignment_proxy_deg", "右手首"),
+    ]
+    wrist_diffs = []
+    for key, label in wrist_pairs:
+        rv, tv = re.get(key, np.nan), ta.get(key, np.nan)
+        if np.isfinite(rv) and np.isfinite(tv):
+            wrist_diffs.append((abs(tv-rv), label, rv, tv))
+    if wrist_diffs:
+        diff, label, rv, tv = max(wrist_diffs)
+        if diff >= 15:
+            add(
+                "手首アライメントproxy",
+                f"{label}の前腕―手掌方向の2D proxyが比較選手と約{diff:.1f}°異なります。",
+                "力学的エネルギーや手関節トルクを測定した値ではありません。インパクト付近で手首が大きく折れていないか、バット軌道と合わせて確認してください。",
+                "短いバットでの低強度ティー、インパクト前後を正面・側方のスロー動画で確認",
+                "upper_limb_energy",
+            )
 
     ref_com, tar_com = re.get("body_center_speed_proxy", np.nan), ta.get("body_center_speed_proxy", np.nan)
     if np.isfinite(ref_com) and np.isfinite(tar_com) and abs(tar_com-ref_com) / max(abs(ref_com), 0.2) >= 0.25:
