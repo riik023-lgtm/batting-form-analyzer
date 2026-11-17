@@ -1,12 +1,9 @@
-"""先行研究に基づく、打撃動画からの身体負担『参考判定』。
+"""ver.10.0: 先行研究を参照した身体負担・改善アドバイス。
 
-v1.9 方針
-- 0〜100の「怪我リスク風スコア」は廃止する。
-- 比較選手との相対差を、根拠となるproxyごとに段階表示する。
-- 「低い＝安全」とは扱わない。
-- 単眼MediaPipe Poseで直接測れないバットヘッド速度、関節トルク、筋活動、
-  真の腰椎側屈は、直接値として扱わない。
-- 速度系proxyは、連続する実測骨格フレーム間だけで計算する。
+重要:
+- 医学的な怪我発生確率は算出しない。
+- 動画で直接測れない筋力、筋厚、関節トルク、地面反力、真の身体重心は断定しない。
+- MediaPipeから得られる運動学的proxyと比較選手との差を段階表示する。
 """
 from __future__ import annotations
 
@@ -15,159 +12,53 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
-LEFT_SHOULDER = 11
-RIGHT_SHOULDER = 12
-LEFT_WRIST = 15
-RIGHT_WRIST = 16
-LEFT_HIP = 23
-RIGHT_HIP = 24
-
 SOURCES = {
-    "oblique": {
+    "swing_characteristics": {
+        "title": "スイング計測装置を用いた大学野球選手の特性分析に関する研究",
+        "url": "https://doi.org/10.1299/transjsme.20-00240",
+        "use": "スイング時間・スイング特性を考える際の参考。センサーバットの値を動画proxyと同一視しない。",
+    },
+    "upper_limb_energy": {
+        "title": "野球の打撃における上肢のエネルギーフロー：バット・ヘッドスピードの上位群と下位群のスイング局面の比較",
+        "url": "https://doi.org/10.5432/jjpehss.17038",
+        "use": "上肢へのエネルギー伝達の研究。動画ではエネルギーを直接測らず、骨盤→肩の回転タイミングの参考にする。",
+    },
+    "swing_angle": {
+        "title": "スイング角度およびローリング角速度が打球特性に及ぼす影響（野球のインパクトシミュレーション）",
+        "url": "https://doi.org/10.32226/jjbse.2012_007",
+        "use": "バット軌道の解釈に利用。Poseだけではバット角度を直接測れないため、現版では採点しない。",
+    },
+    "impact_reproducibility": {
+        "title": "インパクト位置の再現性に関わる野球打撃動作の検討－大学野球打者によるティー打撃を対象として－",
+        "url": "https://www.ritsumei.ac.jp/~isaka/ronbun/misaki.pdf",
+        "use": "骨盤傾斜・体幹・上肢などのばらつきとインパクト再現性を考える参考。再現性判定には複数スイングが必要。",
+    },
+    "trunk_muscle": {
+        "title": "野球競技におけるバットスイングパフォーマンスと体幹筋形態の関係に関する研究",
+        "url": "https://www.ritsumei.ac.jp/~isaka/ronbun/tutikane.pdf",
+        "use": "体幹筋とバットスイングの関係の参考。動画から筋厚・筋力は推定せず、回旋動作だけを評価する。",
+    },
+    "batting_running": {
+        "title": "打撃に走塁条件が加わる複合運動が打撃スイング速度および打撃動作へ及ぼす影響",
+        "url": "https://doi.org/10.5432/jjpehss.039-24118",
+        "use": "肩・腰角速度、身体重心位置・速度などの観点を参考。動画では身体中心速度proxyとして扱う。",
+    },
+    "follow_through": {
         "title": "Torso dynamics during follow through in baseball batting",
         "url": "https://doi.org/10.1080/14763141.2022.2071328",
-        "note": (
-            "大学野球選手29名のモーションキャプチャ研究。右打者のフォロースルーで"
-            "左外腹斜筋の伸張性収縮が示唆され、インパクト直後のバットヘッド速度が高いほど"
-            "体幹回旋トルク・パワーとの関連が大きかった。"
-        ),
+        "use": "フォロースルー時の体幹回旋・腹斜筋負担を考える参考。",
     },
-    "low_back": {
+    "low_back_case": {
         "title": "バッティング動作により腰痛を発症した高校野球選手の1症例",
         "url": "https://doi.org/10.14902/kinkipt.2008.0.98.0",
-        "note": (
-            "腰痛を発症した高校野球選手1例の三次元動作解析。外角打ちでは体幹側屈と"
-            "腰椎回旋が大きく、腰椎ストレス増大の可能性が考察された。空振り時の急激な"
-            "脊柱運動についても傷害要因の可能性が述べられている。症例報告のため一般化には注意が必要。"
-        ),
-    },
-    "throwing": {
-        "title": "Risk factors associated with throwing injuries in young baseball players",
-        "url": "https://doi.org/10.1016/j.jse.2023.01.034",
-        "note": (
-            "小学生野球選手2466名の投球障害研究。肩内旋可動域、非利き側股関節内旋可動域、"
-            "柔軟性などが投球障害と関連した。ただし『投球』研究であり、打撃動画だけから"
-            "肩・肘の傷害リスクを採点する根拠には直接用いない。"
-        ),
+        "use": "体幹側屈・回旋と腰部負担を考える参考。1症例であり一般化には注意。",
     },
     "opening": {
         "title": "『身体が開く』とは？青木宣親から学ぶ、身体の開きを抑える方法",
         "url": "https://victorysportsnews.com/articles/7155",
-        "note": (
-            "実践解説記事。身体の開きを『腰の回転開始が早い状態』として説明し、"
-            "後ろ足・股関節で開きを制御する練習としてアウトエッジランジ等を紹介している。"
-            "傷害研究ではなくフォーム改善の参考として扱う。"
-        ),
+        "use": "傷害根拠ではなくフォーム改善の実践参考。",
     },
 }
-
-
-def _horizontal_line_angle(left_point, right_point):
-    dx = right_point[0] - left_point[0]
-    dz = right_point[2] - left_point[2]
-    return float(np.degrees(np.arctan2(dz, dx)))
-
-
-def _signed_angle_difference(a, b):
-    return np.degrees(
-        np.arctan2(
-            np.sin(np.radians(a - b)),
-            np.cos(np.radians(a - b)),
-        )
-    )
-
-
-def _nan_rolling_mean(values, window):
-    values = np.asarray(values, dtype=float)
-    if values.size == 0:
-        return values
-    return (
-        pd.Series(values)
-        .rolling(window=max(1, int(window)), center=True, min_periods=1)
-        .mean()
-        .to_numpy()
-    )
-
-
-def _safe_max(values, default=np.nan):
-    values = np.asarray(values, dtype=float)
-    finite = values[np.isfinite(values)]
-    return float(np.max(finite)) if finite.size else float(default)
-
-
-def _masked_pair_speed(points, fps, valid_mask):
-    points = np.asarray(points, dtype=float)
-    valid_mask = np.asarray(valid_mask, dtype=bool)
-    if len(points) < 2:
-        return np.full(len(points), np.nan)
-    speed = np.full(len(points), np.nan, dtype=float)
-    diffs = np.linalg.norm(np.diff(points, axis=0), axis=1) * fps
-    pair_valid = valid_mask[:-1] & valid_mask[1:]
-    speed[1:][pair_valid] = diffs[pair_valid]
-    return speed
-
-
-def _masked_angle_velocity(angles, fps, valid_mask):
-    angles = np.asarray(angles, dtype=float)
-    valid_mask = np.asarray(valid_mask, dtype=bool)
-    unwrapped = np.degrees(np.unwrap(np.radians(angles)))
-    velocity = np.full(len(unwrapped), np.nan, dtype=float)
-    if len(unwrapped) >= 2:
-        diffs = np.diff(unwrapped) * fps
-        pair_valid = valid_mask[:-1] & valid_mask[1:]
-        velocity[1:][pair_valid] = diffs[pair_valid]
-    return velocity
-
-
-def _motion_metrics(analysis) -> Dict[str, float]:
-    world = np.asarray(analysis.world_landmarks, dtype=float)
-    valid = np.asarray(analysis.valid_mask, dtype=bool)
-    fps = max(float(analysis.fps), 1e-6)
-    impact = int(np.clip(analysis.impact_frame, 0, len(world) - 1))
-
-    shoulder_angles = np.asarray([
-        _horizontal_line_angle(frame[LEFT_SHOULDER], frame[RIGHT_SHOULDER])
-        for frame in world
-    ], dtype=float)
-    hip_angles = np.asarray([
-        _horizontal_line_angle(frame[LEFT_HIP], frame[RIGHT_HIP])
-        for frame in world
-    ], dtype=float)
-
-    signed_sep = _signed_angle_difference(shoulder_angles, hip_angles)
-    sep_abs = np.abs(signed_sep).astype(float)
-    sep_abs[~valid] = np.nan
-
-    torso_ang_vel = _masked_angle_velocity(signed_sep, fps, valid)
-    torso_speed = np.abs(torso_ang_vel)
-    smooth_window = max(3, int(round(fps * 0.06)))
-    torso_speed_smooth = _nan_rolling_mean(torso_speed, smooth_window)
-
-    # 急減速も、速度値が連続して実測由来の箇所だけを使う。
-    torso_deceleration = np.full(len(torso_speed_smooth), np.nan, dtype=float)
-    if len(torso_speed_smooth) >= 2:
-        delta = np.diff(torso_speed_smooth) * fps
-        finite_pair = np.isfinite(torso_speed_smooth[:-1]) & np.isfinite(torso_speed_smooth[1:])
-        decel = np.maximum(0.0, -delta)
-        torso_deceleration[1:][finite_pair] = decel[finite_pair]
-
-    left_wrist = world[:, LEFT_WRIST, :3]
-    right_wrist = world[:, RIGHT_WRIST, :3]
-    left_speed = _masked_pair_speed(left_wrist, fps, valid)
-    right_speed = _masked_pair_speed(right_wrist, fps, valid)
-    wrist_speed = 0.5 * (left_speed + right_speed)
-    wrist_speed = _nan_rolling_mean(wrist_speed, smooth_window)
-
-    pre = max(0, impact - int(round(0.25 * fps)))
-    post = min(len(world), impact + int(round(0.35 * fps)) + 1)
-    wrist_post_end = min(len(wrist_speed), impact + int(round(0.15 * fps)) + 1)
-
-    return {
-        "max_torso_separation_deg": _safe_max(sep_abs[pre:post]),
-        "post_torso_rotation_speed_deg_s": _safe_max(torso_speed[impact:post]),
-        "post_torso_rotation_deceleration_deg_s2": _safe_max(torso_deceleration[impact:post]),
-        "post_wrist_speed_proxy_m_s": _safe_max(wrist_speed[max(0, impact - 1):wrist_post_end]),
-    }
 
 
 def _relative_change(target, reference, floor):
@@ -177,177 +68,207 @@ def _relative_change(target, reference, floor):
     return (float(target) - float(reference)) / scale
 
 
-def _comparison_label(change):
+def _label_from_change(change, moderate=0.20, high=0.40):
     if not np.isfinite(change):
         return "評価困難"
-    if change >= 0.40:
-        return "大きく高い"
-    if change >= 0.15:
-        return "やや高い"
-    if change <= -0.40:
-        return "大きく低い"
-    if change <= -0.15:
-        return "やや低い"
-    return "同程度"
+    magnitude = abs(float(change))
+    if magnitude >= high:
+        return "注意要素あり"
+    if magnitude >= moderate:
+        return "やや注意"
+    return "明確な増大なし"
 
 
-def _component_row(name, target, reference, unit, rationale, floor):
-    change = _relative_change(target, reference, floor=floor)
-    return {
-        "指標": name,
-        "自分": round(float(target), 2) if np.isfinite(target) else np.nan,
-        "比較選手": round(float(reference), 2) if np.isfinite(reference) else np.nan,
-        "差率": round(float(change * 100.0), 1) if np.isfinite(change) else np.nan,
-        "比較結果": _comparison_label(change),
-        "単位": unit,
-        "根拠": rationale,
-    }
-
-
-def _region_judgement(component_labels):
-    labels = list(component_labels)
-    if any(label == "評価困難" for label in labels):
+def _overall(labels: List[str]):
+    if "注意要素あり" in labels:
+        return "注意要素あり"
+    if "やや注意" in labels:
+        return "やや注意"
+    if all(v == "評価困難" for v in labels):
         return "評価困難"
-    high = sum(label == "大きく高い" for label in labels)
-    mild = sum(label == "やや高い" for label in labels)
-    if high >= 1 or mild >= 2:
-        return "注意要素あり"
-    if mild == 1:
-        return "やや注意"
     return "明確な増大なし"
 
 
-def _overall_judgement(region_labels):
-    labels = list(region_labels)
-    if any(label == "評価困難" for label in labels):
-        return "一部評価困難"
-    if any(label == "注意要素あり" for label in labels):
-        return "注意要素あり"
-    if any(label == "やや注意" for label in labels):
-        return "やや注意"
-    return "明確な増大なし"
+def assess_body_load(reference_analysis, target_analysis, batter_side="右打者") -> Dict:
+    """比較選手との差から身体負担関連動作を段階表示する。"""
+    re = reference_analysis.extra_metrics
+    ta = target_analysis.extra_metrics
 
-
-def assess_body_load(reference_analysis, target_analysis, batter_side="右打者"):
-    """部位別の身体負担関連動作を、点数ではなく段階評価で返す。"""
-    ref = _motion_metrics(reference_analysis)
-    tar = _motion_metrics(target_analysis)
-
-    component_rows = [
-        _component_row(
-            "最大肩-骨盤相対回旋",
-            tar["max_torso_separation_deg"], ref["max_torso_separation_deg"],
-            "deg", "腰部回旋負荷のproxy", 8.0,
-        ),
-        _component_row(
-            "インパクト後の体幹回旋速度",
-            tar["post_torso_rotation_speed_deg_s"], ref["post_torso_rotation_speed_deg_s"],
-            "deg/s", "フォロースルーの回旋動態proxy", 80.0,
-        ),
-        _component_row(
-            "インパクト後の体幹回旋急減速",
-            tar["post_torso_rotation_deceleration_deg_s2"], ref["post_torso_rotation_deceleration_deg_s2"],
-            "deg/s²", "急激な回旋制動のproxy", 800.0,
-        ),
-        _component_row(
-            "インパクト直後の手首速度",
-            tar["post_wrist_speed_proxy_m_s"], ref["post_wrist_speed_proxy_m_s"],
-            "m/s (Pose proxy)", "バットヘッド速度の代替proxy（同一ではない）", 0.6,
-        ),
-    ]
-    components = pd.DataFrame(component_rows)
-
-    lookup = {row["指標"]: row["比較結果"] for row in component_rows}
-    low_back_label = _region_judgement([
-        lookup["最大肩-骨盤相対回旋"],
-        lookup["インパクト後の体幹回旋速度"],
-        lookup["インパクト後の体幹回旋急減速"],
-    ])
-    oblique_label = _region_judgement([
-        lookup["インパクト直後の手首速度"],
-        lookup["インパクト後の体幹回旋速度"],
-        lookup["インパクト後の体幹回旋急減速"],
-    ])
-
-    side_note = (
-        "右打者の研究結果を直接参照。投手側は左側腹斜筋を想定。"
-        if batter_side == "右打者"
-        else "右打者研究を左右反転して参考表示。左打者での直接検証ではありません。"
+    side_change = _relative_change(
+        ta.get("torso_side_bend_change_deg", np.nan),
+        re.get("torso_side_bend_change_deg", np.nan),
+        5.0,
     )
+    sep_change = _relative_change(
+        target_analysis.features.get("hip_shoulder_separation", np.nan),
+        reference_analysis.features.get("hip_shoulder_separation", np.nan),
+        12.0,
+    )
+    hip_speed_change = _relative_change(
+        ta.get("hip_rotation_speed_deg_s", np.nan),
+        re.get("hip_rotation_speed_deg_s", np.nan),
+        150.0,
+    )
+    shoulder_speed_change = _relative_change(
+        ta.get("shoulder_rotation_speed_deg_s", np.nan),
+        re.get("shoulder_rotation_speed_deg_s", np.nan),
+        150.0,
+    )
+    pelvis_tilt_change = _relative_change(
+        ta.get("pelvis_tilt_change_deg", np.nan),
+        re.get("pelvis_tilt_change_deg", np.nan),
+        5.0,
+    )
+
+    low_back_magnitude = np.nanmax(np.abs([side_change, sep_change, hip_speed_change]))
+    low_back_label = _label_from_change(low_back_magnitude, moderate=0.25, high=0.50)
+    oblique_magnitude = np.nanmax(np.abs([hip_speed_change, shoulder_speed_change, sep_change]))
+    oblique_label = _label_from_change(oblique_magnitude, moderate=0.25, high=0.50)
+    pelvis_label = _label_from_change(pelvis_tilt_change, moderate=0.35, high=0.70)
 
     regions = pd.DataFrame([
         {
-            "部位": "腰部・脊柱",
+            "部位": "腰部・体幹",
             "判定": low_back_label,
-            "主な計測proxy": "肩-骨盤の相対回旋量、インパクト後の回旋速度・急減速",
-            "根拠": "腰痛症例報告で体幹側屈・腰椎回旋増大、急激な脊柱運動がストレス要因として考察",
-            "エビデンス上の注意": "1症例。側屈は単眼動画では信頼性が低いため本判定から除外",
+            "主な計測proxy": "体幹側屈proxy、肩-骨盤捻転差、骨盤回転速度",
+            "根拠と注意": "腰痛症例・体幹回旋研究を参考。単眼動画から腰椎負荷そのものは測定していません。",
         },
         {
-            "部位": "投手側の脇腹・腹斜筋",
+            "部位": "脇腹・腹斜筋周辺",
             "判定": oblique_label,
-            "主な計測proxy": "インパクト直後の手首速度、体幹回旋速度、フォロースルーの急減速",
-            "根拠": "フォロースルーで外腹斜筋の伸張性収縮が示唆され、バットヘッド速度と体幹回旋トルク/パワーが関連",
-            "エビデンス上の注意": "バット速度・トルクを直接測定していないためproxy。" + side_note,
+            "主な計測proxy": "骨盤/肩回転速度、肩-骨盤捻転差",
+            "根拠と注意": "フォロースルー・体幹筋研究を参考。筋活動・筋厚は動画から測定していません。",
+        },
+        {
+            "部位": "骨盤・下肢連動",
+            "判定": pelvis_label,
+            "主な計測proxy": "骨盤左右傾斜変化、身体中心移動proxy",
+            "根拠と注意": "インパクト再現性研究を参考。地面反力や真の重心位置は測定していません。",
         },
     ])
 
-    overall_label = _overall_judgement(regions["判定"].tolist())
+    components = pd.DataFrame([
+        {"指標": "体幹側屈変化", "比較選手": re.get("torso_side_bend_change_deg"), "自分": ta.get("torso_side_bend_change_deg"), "単位": "deg"},
+        {"指標": "骨盤傾斜変化", "比較選手": re.get("pelvis_tilt_change_deg"), "自分": ta.get("pelvis_tilt_change_deg"), "単位": "deg"},
+        {"指標": "身体中心移動proxy", "比較選手": re.get("body_center_shift_proxy"), "自分": ta.get("body_center_shift_proxy"), "単位": "shoulder-width ratio"},
+        {"指標": "身体中心速度proxy", "比較選手": re.get("body_center_speed_proxy"), "自分": ta.get("body_center_speed_proxy"), "単位": "shoulder-width/sec"},
+        {"指標": "骨盤→肩ピーク時間差", "比較選手": re.get("hip_to_shoulder_peak_delay_ms"), "自分": ta.get("hip_to_shoulder_peak_delay_ms"), "単位": "ms"},
+        {"指標": "スイング開始→インパクト", "比較選手": re.get("swing_time_sec"), "自分": ta.get("swing_time_sec"), "単位": "sec"},
+    ])
 
-    guidance: List[Dict[str, str]] = []
-    if low_back_label in {"注意要素あり", "やや注意"}:
+    guidance = []
+    if low_back_label in {"やや注意", "注意要素あり"}:
         guidance.append({
-            "部位": "腰部・脊柱",
-            "改善の方向性": (
-                "比較選手より体幹の相対回旋またはフォロースルーの急な回旋変化が大きい項目があります。"
-                "低強度のティー打撃で、胸郭と骨盤が過度にねじれたまま急停止しないか確認してください。"
-            ),
-            "練習例": "50〜70%強度のコース別ティー、スロー動画でインパクト後0.3秒の体幹回旋を確認、段階的に強度を上げる",
+            "部位": "腰部・体幹",
+            "改善の方向性": "比較選手との差が大きい体幹側屈・捻転・骨盤回転を個別に確認し、強い捻りや急な制動だけを増やさないでください。",
+            "練習例": "50〜70%強度のティー打撃、フォロースルーを途中で止めない連続素振り、スロー動画で体幹傾きを確認",
+            "参考": SOURCES["low_back_case"]["title"],
         })
-    if oblique_label in {"注意要素あり", "やや注意"}:
+    if oblique_label in {"やや注意", "注意要素あり"}:
         guidance.append({
-            "部位": "脇腹・腹斜筋",
-            "改善の方向性": (
-                "フォロースルーでの回旋速度・制動proxyの一部が比較選手より高い傾向です。"
-                "強振だけを繰り返さず、フォロースルーまで滑らかに回転を逃がす動作を確認してください。"
-            ),
-            "練習例": "軽いバット/低強度スイング→通常スイングへ段階的に移行、フォロースルーを途中で止めない連続素振り",
+            "部位": "脇腹・腹斜筋周辺",
+            "改善の方向性": "筋力不足とは断定せず、骨盤と肩の回転タイミングおよびフォロースルーまでの回転の滑らかさを確認してください。",
+            "練習例": "軽いバット→通常バットの段階的スイング、メディシンボール回旋、分解素振り",
+            "参考": SOURCES["follow_through"]["title"],
         })
-
+    if pelvis_label in {"やや注意", "注意要素あり"}:
+        guidance.append({
+            "部位": "骨盤・姿勢",
+            "改善の方向性": "骨盤傾斜の変化が大きい場合、単発の良否ではなく同じ撮影条件で複数スイングのばらつきを確認してください。",
+            "練習例": "同条件で3〜5スイング撮影し、インパクト付近の骨盤傾斜と体幹傾きを比較",
+            "参考": SOURCES["impact_reproducibility"]["title"],
+        })
     if not guidance:
         guidance.append({
             "部位": "全体",
-            "改善の方向性": (
-                "今回計測できたproxyでは、比較選手より明確に増大した身体負担関連動作は検出されませんでした。"
-                "これは『安全』や『怪我しない』ことを意味しません。"
-            ),
-            "練習例": "現在のフォームを維持しつつ、疲労や痛みがある日は強度を下げてください。",
+            "改善の方向性": "今回測定できたproxyでは、比較選手より明確に大きい身体負担関連動作は検出されませんでした。これは安全を保証する意味ではありません。",
+            "練習例": "同じ撮影条件で複数回測定し、フォームのばらつきを確認",
+            "参考": "複数の先行研究",
         })
 
     return {
-        "overall_label": overall_label,
+        "overall_label": _overall(regions["判定"].tolist()),
         "regions": regions,
         "components": components,
         "guidance": pd.DataFrame(guidance),
         "sources": SOURCES,
         "limitations": (
-            "本判定は医学的な怪我発生確率ではありません。比較選手との差と先行研究で論点となった動作を"
-            "段階表示する参考情報です。撮影角度、MediaPipeの単眼3D推定、インパクト推定誤差の影響を受けます。"
-            "痛み・既往歴・疲労・筋力・可動域などは評価していません。"
+            "本判定は医学的診断や怪我発生確率ではありません。単眼動画とMediaPipeから得られる運動学的proxyを、"
+            "比較選手との差および先行研究で論点となった動作と照合した参考情報です。筋力、筋厚、関節トルク、"
+            "地面反力、真の身体重心、バットヘッド速度は直接測定していません。"
         ),
     }
 
 
-def evidence_based_form_tip(lowest_item):
-    """提供された実践記事は傷害根拠ではなく、フォーム改善の補足だけに使う。"""
-    if lowest_item == "身体を開くな":
-        return {
-            "title": "身体の開きへの補足",
-            "text": (
-                "VICTORYの実践解説では、身体の開きを腰の回転開始が早い状態として説明し、"
-                "後ろ足側の股関節操作と『アウトエッジランジ』を練習例として紹介しています。"
-                "これは傷害リスク研究ではなく、フォーム改善の参考情報です。"
-            ),
-            "url": SOURCES["opening"]["url"],
-        }
-    return None
+def research_based_advice(reference_analysis, target_analysis) -> pd.DataFrame:
+    """新規6研究を中心に、追加指標から改善候補を出す。"""
+    re = reference_analysis.extra_metrics
+    ta = target_analysis.extra_metrics
+    rows = []
+
+    def add(topic, finding, advice, training, key):
+        src = SOURCES[key]
+        rows.append({
+            "観点": topic,
+            "検出内容": finding,
+            "改善アドバイス": advice,
+            "練習例": training,
+            "参考研究": src["title"],
+            "リンク": src["url"],
+        })
+
+    ref_time, tar_time = re.get("swing_time_sec", np.nan), ta.get("swing_time_sec", np.nan)
+    if np.isfinite(ref_time) and np.isfinite(tar_time) and tar_time > ref_time * 1.15:
+        add(
+            "スイング時間",
+            f"スイング開始からインパクトまでが比較選手より{tar_time-ref_time:.3f}秒長く推定されました。",
+            "速く振ることだけを目的にせず、動作開始からインパクトまでに余分な停滞がないか確認してください。",
+            "50〜70%強度の連続ティー→通常スイング、同じテンポでの反復",
+            "swing_characteristics",
+        )
+
+    ref_delay, tar_delay = re.get("hip_to_shoulder_peak_delay_ms", np.nan), ta.get("hip_to_shoulder_peak_delay_ms", np.nan)
+    if np.isfinite(ref_delay) and np.isfinite(tar_delay) and abs(tar_delay - ref_delay) >= 60:
+        add(
+            "骨盤→肩の運動連鎖",
+            f"骨盤回転速度ピークから肩回転速度ピークまでの時間差が比較選手と約{abs(tar_delay-ref_delay):.0f}ms異なります。",
+            "エネルギー伝達そのものは測定していませんが、骨盤と肩の回転順序をスロー動画で確認してください。",
+            "ステップ→骨盤→肩の順を意識した分解素振り、メディシンボール回旋",
+            "upper_limb_energy",
+        )
+
+    ref_com, tar_com = re.get("body_center_speed_proxy", np.nan), ta.get("body_center_speed_proxy", np.nan)
+    if np.isfinite(ref_com) and np.isfinite(tar_com) and abs(tar_com-ref_com) / max(abs(ref_com), 0.2) >= 0.25:
+        add(
+            "身体中心速度proxy",
+            "スイング中盤までの身体中心速度proxyが比較選手と大きく異なります。",
+            "真の身体重心速度ではありません。身体全体の前方移動と回転がどのタイミングで起きているかを確認してください。",
+            "歩きティー、ステップ打撃、打撃後に一塁へ1〜2歩出る実戦ドリル",
+            "batting_running",
+        )
+
+    ref_tilt, tar_tilt = re.get("pelvis_tilt_change_deg", np.nan), ta.get("pelvis_tilt_change_deg", np.nan)
+    ref_side, tar_side = re.get("torso_side_bend_change_deg", np.nan), ta.get("torso_side_bend_change_deg", np.nan)
+    if (
+        np.isfinite(ref_tilt) and np.isfinite(tar_tilt) and abs(tar_tilt-ref_tilt) >= 8
+    ) or (
+        np.isfinite(ref_side) and np.isfinite(tar_side) and abs(tar_side-ref_side) >= 8
+    ):
+        add(
+            "インパクト再現性に関わる姿勢proxy",
+            "骨盤傾斜または体幹側屈の変化が比較選手と大きく異なります。",
+            "1スイングだけで再現性は判定できないため、同じ条件で3〜5回撮影してばらつきを確認してください。",
+            "ティー位置を固定した3〜5球の連続測定、各回の骨盤傾斜・体幹傾きの比較",
+            "impact_reproducibility",
+        )
+
+    if not rows:
+        add(
+            "追加指標",
+            "今回の追加proxyでは大きな差は検出されませんでした。",
+            "単発の結果だけでなく、複数スイングの再現性を見ると改善点を見つけやすくなります。",
+            "同条件で3〜5スイングを保存し、履歴グラフを比較",
+            "impact_reproducibility",
+        )
+
+    return pd.DataFrame(rows)

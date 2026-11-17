@@ -1,8 +1,8 @@
-streamlit
-mediapipe
-opencv-python-headless
-numpy
-pandas
-matplotlib
-imageio-ffmpeg
-reportlab
+streamlit>=1.42,<2
+mediapipe>=0.10.14
+opencv-python-headless>=4.9
+numpy>=1.26
+pandas>=2.2
+matplotlib>=3.8
+imageio-ffmpeg>=0.5
+reportlab>=4.0
